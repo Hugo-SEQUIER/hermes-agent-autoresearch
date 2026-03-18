@@ -136,6 +136,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "autoresearch": {
+        "description": "Workspace-defined bounded AutoResearch cycles for optional research automation",
+        "tools": ["autoresearch"],
+        "includes": []
+    },
+    
     "rl": {
         "description": "RL training tools for running reinforcement learning on Tinker-Atropos",
         "tools": [
@@ -552,3 +558,4 @@ if __name__ == "__main__":
     print(f"  Created 'my_custom' toolset:")
     print(f"    Description: {custom_info['description']}")
     print(f"    Resolved tools: {', '.join(custom_info['resolved_tools'])}")
+

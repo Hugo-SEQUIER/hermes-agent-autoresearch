@@ -83,6 +83,7 @@ def _discover_tools():
         "tools.skill_manager_tool",
         "tools.browser_tool",
         "tools.cronjob_tools",
+        "tools.autoresearch_tool",
         "tools.rl_training_tool",
         "tools.tts_tool",
         "tools.todo_tool",
@@ -384,3 +385,4 @@ def check_toolset_requirements() -> Dict[str, bool]:
 def check_tool_availability(quiet: bool = False) -> Tuple[List[str], List[dict]]:
     """Return (available_toolsets, unavailable_info)."""
     return registry.check_tool_availability(quiet=quiet)
+
