@@ -222,6 +222,11 @@ class APIServerAdapter(BasePlatformAdapter):
         app.router.add_post("/api/research/runs/{run_id}/stop", self._handle_research_run_stop)
         app.router.add_post("/api/research/runs/{run_id}/chat", self._handle_research_run_chat)
         app.router.add_post("/api/research/runs/{run_id}/request-mutation", self._handle_research_run_request_mutation)
+        app.router.add_get("/api/research/runs/{run_id}/iterations", self._handle_research_run_iterations)
+        app.router.add_get(
+            "/api/research/runs/{run_id}/iterations/{iteration}/mutation-audit",
+            self._handle_research_iteration_mutation_audit,
+        )
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -880,6 +885,39 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._json_error(f"Research run not found: {run_id}", status=404)
 
         return web.json_response({"object": "research.event", "data": event, "run": run})
+
+    async def _handle_research_run_iterations(self, request: "web.Request") -> "web.Response":
+        """GET /api/research/runs/{run_id}/iterations — list iteration summaries."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            iterations = self._research_manager.list_iterations(run_id)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "list", "data": iterations})
+
+    async def _handle_research_iteration_mutation_audit(self, request: "web.Request") -> "web.Response":
+        """GET /api/research/runs/{run_id}/iterations/{iteration}/mutation-audit — mutation audit with diffs."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            iteration = int(request.match_info["iteration"])
+        except ValueError:
+            return self._json_error("Iteration must be an integer")
+
+        try:
+            audit = self._research_manager.get_mutation_audit(run_id, iteration)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "research.mutation_audit", "data": audit})
 
     async def _handle_research_run_events(self, request: "web.Request") -> "web.StreamResponse":
         auth_err = self._check_auth(request)

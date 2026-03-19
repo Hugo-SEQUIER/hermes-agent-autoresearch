@@ -324,6 +324,48 @@ class AutoResearchStore:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def list_iteration_numbers(self, run_id: str) -> List[int]:
+        """Return sorted iteration numbers that have directories on disk."""
+        iterations_dir = self._run_dir(run_id) / "iterations"
+        if not iterations_dir.exists():
+            return []
+        numbers: List[int] = []
+        for entry in sorted(iterations_dir.iterdir()):
+            if entry.is_dir():
+                try:
+                    numbers.append(int(entry.name))
+                except ValueError:
+                    continue
+        return numbers
+
+    def load_mutation_audit_diffs(self, run_id: str, iteration: int) -> Dict[str, str]:
+        """Read all diff files from an iteration's mutator_audit directory.
+
+        Returns a mapping of ``{relative_path: diff_content}``.
+        """
+        audit_dir = (
+            self._run_dir(run_id)
+            / "iterations"
+            / f"{max(0, int(iteration)):04d}"
+            / "artifacts"
+            / "mutator_audit"
+            / "diffs"
+        )
+        if not audit_dir.exists():
+            return {}
+        diffs: Dict[str, str] = {}
+        with self._lock:
+            for diff_file in sorted(audit_dir.rglob("*.diff")):
+                relative_key = diff_file.relative_to(audit_dir).as_posix()
+                # Strip the .diff suffix to get the original relative path
+                if relative_key.endswith(".diff"):
+                    relative_key = relative_key[: -len(".diff")]
+                try:
+                    diffs[relative_key] = diff_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+        return diffs
+
     def _run_dir(self, run_id: str) -> Path:
         return self.root / run_id
 

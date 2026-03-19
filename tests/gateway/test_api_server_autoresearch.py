@@ -95,6 +95,67 @@ class TestAutoResearchEndpoints:
             assert "mutation.requested" in body
 
     @pytest.mark.asyncio
+    async def test_iterations_list_and_mutation_audit(self):
+        adapter = _make_adapter()
+        app = adapter._build_app()
+
+        async with TestClient(TestServer(app)) as cli:
+            # Create a run with a couple of iterations
+            create_resp = await cli.post(
+                "/api/research/runs",
+                json={
+                    "name": "Iteration test",
+                    "goal": "Test iteration and audit endpoints",
+                    "max_iterations": 2,
+                    "autostart": True,
+                },
+            )
+            assert create_resp.status == 201
+            run_id = (await create_resp.json())["data"]["id"]
+
+            # Wait briefly for completion (minimal run with no manifest commands)
+            import asyncio
+            await asyncio.sleep(1.0)
+
+            # List iterations
+            iter_resp = await cli.get(f"/api/research/runs/{run_id}/iterations")
+            assert iter_resp.status == 200
+            iter_data = await iter_resp.json()
+            assert iter_data["object"] == "list"
+            assert len(iter_data["data"]) >= 1
+
+            # Get mutation audit for iteration 1
+            audit_resp = await cli.get(
+                f"/api/research/runs/{run_id}/iterations/1/mutation-audit"
+            )
+            assert audit_resp.status == 200
+            audit_data = await audit_resp.json()
+            assert audit_data["object"] == "research.mutation_audit"
+            assert audit_data["data"]["iteration"] == 1
+            assert "changed_paths" in audit_data["data"]
+            assert "diffs" in audit_data["data"]
+
+    @pytest.mark.asyncio
+    async def test_iterations_404_for_missing_run(self):
+        adapter = _make_adapter()
+        app = adapter._build_app()
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/research/runs/nonexistent/iterations")
+            assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_mutation_audit_invalid_iteration(self):
+        adapter = _make_adapter()
+        app = adapter._build_app()
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/research/runs/fake/iterations/abc/mutation-audit"
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
     async def test_research_routes_require_auth_when_key_is_set(self):
         adapter = _make_adapter(api_key="sk-secret")
         app = adapter._build_app()

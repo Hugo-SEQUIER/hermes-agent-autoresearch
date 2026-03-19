@@ -95,6 +95,104 @@ class AutoResearchManager:
         self._require_run(run_id)
         return [self._serialize_metric(metric) for metric in self.store.list_metrics(run_id)]
 
+    def list_iterations(self, run_id: str) -> List[Dict[str, Any]]:
+        """Return per-iteration summaries derived from candidates and metrics."""
+        self._require_run(run_id)
+        candidates = self.store.list_candidates(run_id)
+        metrics = self.store.list_metrics(run_id)
+
+        candidates_by_iter: Dict[int, Any] = {}
+        for candidate in candidates:
+            candidates_by_iter[candidate.iteration] = candidate
+
+        metrics_by_iter: Dict[int, List[Any]] = {}
+        for metric in metrics:
+            metrics_by_iter.setdefault(metric.iteration, []).append(metric)
+
+        iteration_numbers = sorted(
+            set(candidates_by_iter.keys())
+            | set(metrics_by_iter.keys())
+            | set(self.store.list_iteration_numbers(run_id))
+        )
+
+        results: List[Dict[str, Any]] = []
+        for iteration in iteration_numbers:
+            candidate = candidates_by_iter.get(iteration)
+            iter_metrics = metrics_by_iter.get(iteration, [])
+
+            mutation_changed = 0
+            mutation_blocked = 0
+            primary_metric_name = None
+            primary_metric_value = None
+            for m in iter_metrics:
+                if m.name == "mutation.changed_files":
+                    mutation_changed = int(m.value)
+                elif m.name == "mutation.blocked_files":
+                    mutation_blocked = int(m.value)
+                elif m.name not in ("mutation.allowed_files", "iteration_progress"):
+                    if primary_metric_name is None:
+                        primary_metric_name = m.name
+                        primary_metric_value = m.value
+
+            entry: Dict[str, Any] = {
+                "iteration": iteration,
+                "status": candidate.status if candidate else "unknown",
+                "title": candidate.title if candidate else f"Iteration {iteration}",
+                "has_mutation_audit": mutation_changed > 0 or mutation_blocked > 0,
+                "mutation_changed_files": mutation_changed,
+                "mutation_blocked_files": mutation_blocked,
+            }
+            if primary_metric_name:
+                entry["primary_metric"] = {
+                    "name": primary_metric_name,
+                    "value": primary_metric_value,
+                }
+            if candidate:
+                entry["candidate_id"] = candidate.id
+            results.append(entry)
+        return results
+
+    def get_mutation_audit(self, run_id: str, iteration: int) -> Dict[str, Any]:
+        """Return mutation audit data with inline diffs for a specific iteration."""
+        self._require_run(run_id)
+
+        # Find the candidate for this iteration to get structured audit metadata
+        candidates = self.store.list_candidates(run_id)
+        candidate = None
+        for c in candidates:
+            if c.iteration == iteration:
+                candidate = c
+                break
+
+        audit_meta: Dict[str, Any] = {}
+        if candidate and isinstance(candidate.metadata, dict):
+            mutator_block = candidate.metadata.get("mutator")
+            if isinstance(mutator_block, dict):
+                audit_meta = dict(mutator_block.get("audit") or {})
+
+        # Load diff file contents from disk
+        diffs = self.store.load_mutation_audit_diffs(run_id, iteration)
+
+        # Enrich the changes list with inline diff content
+        changes = list(audit_meta.get("changes") or [])
+        for change in changes:
+            relative_path = change.get("path", "")
+            if relative_path in diffs:
+                change["diff"] = diffs[relative_path]
+
+        return {
+            "iteration": iteration,
+            "run_id": run_id,
+            "workspace_snapshot": audit_meta.get("workspace_snapshot", False),
+            "changed_paths": audit_meta.get("changed_paths") or [],
+            "allowed_paths": audit_meta.get("allowed_paths") or [],
+            "blocked_paths": audit_meta.get("blocked_paths") or [],
+            "restored_paths": audit_meta.get("restored_paths") or [],
+            "changes": changes,
+            "diffs": diffs,
+            "role": audit_meta.get("role"),
+        }
+
     def create_run(
         self,
         *,

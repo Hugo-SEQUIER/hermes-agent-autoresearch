@@ -427,3 +427,84 @@ def test_pause_resume_and_stop_worker_lifecycle(tmp_path):
     assert stopped["status"] == "stopped"
     final = manager.wait_for_status(run["id"], ["stopped"], timeout=1.0)
     assert final is not None
+
+
+def test_list_iterations_returns_per_iteration_summaries(tmp_path):
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch")
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=2)
+    run = manager.create_run(name="Iterations", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    iterations = manager.list_iterations(run["id"])
+    assert len(iterations) == 2
+    assert iterations[0]["iteration"] == 1
+    assert iterations[1]["iteration"] == 2
+    assert "candidate_id" in iterations[0]
+    assert "primary_metric" in iterations[0]
+    assert iterations[0]["primary_metric"]["name"] == "score"
+
+
+def test_list_iterations_includes_mutation_audit_flags(tmp_path):
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    fake_roles = _FakeMutatorRoleRunner()
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch", role_runner=fake_roles)
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=1)
+    manifest["roles"] = {"mutator": {"enabled": True}}
+    manifest.pop("mutation")
+
+    run = manager.create_run(name="Mutation iter", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    iterations = manager.list_iterations(run["id"])
+    assert len(iterations) == 1
+    entry = iterations[0]
+    assert entry["has_mutation_audit"] is True
+    assert entry["mutation_changed_files"] > 0
+
+
+def test_get_mutation_audit_returns_diffs_and_paths(tmp_path):
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    fake_roles = _FakeMutatorRoleRunner()
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch", role_runner=fake_roles)
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=1)
+    manifest["roles"] = {"mutator": {"enabled": True}}
+    manifest.pop("mutation")
+
+    run = manager.create_run(name="Audit run", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    audit = manager.get_mutation_audit(run["id"], 1)
+    assert audit["iteration"] == 1
+    assert audit["run_id"] == run["id"]
+    assert "train.py" in audit["allowed_paths"]
+    assert "evaluate.py" in audit["blocked_paths"]
+    assert "evaluate.py" in audit["restored_paths"]
+    # Diffs should be present for modified files
+    assert len(audit["diffs"]) > 0
+    # At least one change entry should carry inline diff content
+    changes_with_diff = [c for c in audit["changes"] if c.get("diff")]
+    assert len(changes_with_diff) > 0
+
+
+def test_get_mutation_audit_empty_for_no_mutator(tmp_path):
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch")
+    run = manager.create_run(
+        name="No mutator", goal="Test empty audit", autostart=True, max_iterations=1,
+    )
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=3.0)
+    assert completed is not None
+
+    audit = manager.get_mutation_audit(run["id"], 1)
+    assert audit["iteration"] == 1
+    assert audit["changed_paths"] == []
+    assert audit["diffs"] == {}

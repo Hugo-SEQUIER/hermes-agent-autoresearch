@@ -18,6 +18,7 @@ logs/
 data/
 .pytest_cache/
 .codex/
+.claude/
 tmp/
 temp_vision_images/
 hermes-*/*
