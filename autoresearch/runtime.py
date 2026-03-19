@@ -644,21 +644,30 @@ class AutoResearchManager:
         if not metrics and evaluation_result is not None:
             metrics = {"evaluation.exit_code": float(evaluation_result.returncode)}
 
+        promotion_cfg = dict(manifest.get("promotion") or {})
+        preferred_metric = (
+            str(promotion_cfg.get("metric") or "").strip()
+            or str(evaluation_cfg.get("primary_metric") or "").strip()
+            or None
+        )
         primary_metric_name, primary_metric_value = select_primary_metric(
             metrics,
-            preferred_name=str(evaluation_cfg.get("primary_metric") or "").strip() or None,
+            preferred_name=preferred_metric,
         )
-        higher_is_better = bool(evaluation_cfg.get("higher_is_better", True))
+        higher_is_better = bool(
+            promotion_cfg.get("higher_is_better")
+            if "higher_is_better" in promotion_cfg
+            else evaluation_cfg.get("higher_is_better", True)
+        )
         best_before = self._best_metric_value(run_id, primary_metric_name, higher_is_better=higher_is_better)
-        candidate_status = "evaluated"
-        if evaluation_result is not None and evaluation_result.returncode != 0:
-            candidate_status = "failed"
-        elif primary_metric_name and primary_metric_value is not None and is_better_metric(
-            primary_metric_value,
-            best_before,
+        candidate_status = self._evaluate_promotion(
+            evaluation_result=evaluation_result,
+            primary_metric_name=primary_metric_name,
+            primary_metric_value=primary_metric_value,
+            best_before=best_before,
             higher_is_better=higher_is_better,
-        ):
-            candidate_status = "promoted"
+            promotion_cfg=promotion_cfg,
+        )
 
         for metric_name, metric_value in metrics.items():
             self.add_metric(
@@ -1139,6 +1148,60 @@ class AutoResearchManager:
                 return f"Stopping target reached: {target_metric} <= {target_value}"
         return None
 
+    @staticmethod
+    def _evaluate_promotion(
+        *,
+        evaluation_result: Optional[CommandExecutionResult],
+        primary_metric_name: Optional[str],
+        primary_metric_value: Optional[float],
+        best_before: Optional[float],
+        higher_is_better: bool,
+        promotion_cfg: Dict[str, Any],
+    ) -> str:
+        """Decide candidate status using manifest promotion rules.
+
+        Supports:
+        - ``threshold``: absolute value the metric must reach to promote.
+        - ``min_improvement``: minimum delta over best-so-far to promote.
+        - Falls back to simple ``is_better_metric`` when neither is set.
+        """
+        if evaluation_result is not None and evaluation_result.returncode != 0:
+            return "failed"
+
+        if not primary_metric_name or primary_metric_value is None:
+            return "evaluated"
+
+        # Threshold gate: metric must reach an absolute value to be promotable
+        threshold_raw = promotion_cfg.get("threshold")
+        if threshold_raw is not None:
+            try:
+                threshold = float(threshold_raw)
+            except (TypeError, ValueError):
+                threshold = None
+            if threshold is not None:
+                if higher_is_better and primary_metric_value < threshold:
+                    return "evaluated"
+                if not higher_is_better and primary_metric_value > threshold:
+                    return "evaluated"
+
+        # Must beat the previous best
+        if not is_better_metric(primary_metric_value, best_before, higher_is_better=higher_is_better):
+            return "evaluated"
+
+        # Minimum improvement gate: delta over best must exceed a floor
+        min_improvement_raw = promotion_cfg.get("min_improvement")
+        if min_improvement_raw is not None and best_before is not None:
+            try:
+                min_improvement = float(min_improvement_raw)
+            except (TypeError, ValueError):
+                min_improvement = None
+            if min_improvement is not None and min_improvement > 0:
+                delta = abs(primary_metric_value - best_before)
+                if delta < min_improvement:
+                    return "evaluated"
+
+        return "promoted"
+
     def _recent_operator_messages(self, run_id: str, *, limit: int = 3) -> List[Dict[str, Any]]:
         messages = self.store.list_operator_messages(run_id)
         results: List[Dict[str, Any]] = []
@@ -1242,6 +1305,24 @@ class AutoResearchManager:
                 "restored_paths": restored_paths,
             }
         )
+        # Build per-change summaries with truncated diff previews for SSE consumers
+        change_summaries: List[Dict[str, Any]] = []
+        for change in mutation_audit.get("changes") or []:
+            summary: Dict[str, Any] = {
+                "path": change.get("path", ""),
+                "status": change.get("status", ""),
+                "allowed": change.get("allowed", False),
+            }
+            diff_path = change.get("diff_path")
+            if diff_path:
+                try:
+                    diff_text = Path(diff_path).read_text(encoding="utf-8", errors="replace")
+                    summary["diff_preview"] = diff_text[:2000]
+                    summary["diff_truncated"] = len(diff_text) > 2000
+                except OSError:
+                    pass
+            change_summaries.append(summary)
+
         self.append_event(
             run_id,
             "mutator.audit.completed",
@@ -1249,8 +1330,14 @@ class AutoResearchManager:
             data={
                 "iteration": iteration,
                 "changed_paths": mutation_audit.get("changed_paths") or [],
+                "allowed_paths": mutation_audit.get("allowed_paths") or [],
                 "blocked_paths": blocked_paths,
                 "restored_paths": restored_paths,
+                "changed_files": changed_count,
+                "allowed_files": allowed_count,
+                "blocked_files": blocked_count,
+                "changes": change_summaries,
+                "mutator_summary": (role_result.content or "")[:500],
             },
         )
         return mutation_audit

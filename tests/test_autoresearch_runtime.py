@@ -508,3 +508,104 @@ def test_get_mutation_audit_empty_for_no_mutator(tmp_path):
     assert audit["iteration"] == 1
     assert audit["changed_paths"] == []
     assert audit["diffs"] == {}
+
+
+def test_mutator_audit_event_includes_diff_previews_and_summaries(tmp_path):
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    fake_roles = _FakeMutatorRoleRunner()
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch", role_runner=fake_roles)
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=1)
+    manifest["roles"] = {"mutator": {"enabled": True}}
+    manifest.pop("mutation")
+
+    run = manager.create_run(name="Audit event", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    events = manager.list_events(run["id"])
+    audit_events = [e for e in events if e["event_type"] == "mutator.audit.completed"]
+    assert len(audit_events) == 1
+
+    payload = audit_events[0]["payload"]
+    assert payload["changed_files"] > 0
+    assert "allowed_paths" in payload
+    assert isinstance(payload["changes"], list)
+    assert len(payload["changes"]) > 0
+    # At least one change should have a diff_preview
+    previews = [c for c in payload["changes"] if c.get("diff_preview")]
+    assert len(previews) > 0
+    assert "mutator_summary" in payload
+
+
+def test_promotion_with_threshold_gate(tmp_path):
+    """Candidate should not promote if metric is below the threshold."""
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch")
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=1)
+    # The evaluate.py in the demo project produces score=float(iteration),
+    # so iteration 1 → score=1.0. Set threshold above that so the candidate
+    # stays "evaluated" not "promoted".
+    manifest["promotion"] = {
+        "metric": "score",
+        "higher_is_better": True,
+        "threshold": 5.0,
+    }
+
+    run = manager.create_run(name="Threshold gate", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    candidates = manager.list_candidates(run["id"])
+    assert len(candidates) == 1
+    assert candidates[0]["status"] == "evaluated"
+
+
+def test_promotion_with_min_improvement_gate(tmp_path):
+    """Candidate should not promote when improvement is below min_improvement."""
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch")
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=2)
+    # min_improvement=10.0 means the second candidate must beat the first by 10+.
+    # The demo project produces very close scores, so second candidate stays "evaluated".
+    manifest["promotion"] = {
+        "metric": "score",
+        "higher_is_better": True,
+        "min_improvement": 10.0,
+    }
+
+    run = manager.create_run(name="Min improvement", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    candidates = manager.list_candidates(run["id"])
+    assert len(candidates) == 2
+    # First candidate has no prior best, so it promotes (no delta check applies)
+    assert candidates[0]["status"] == "promoted"
+    # Second candidate should not promote since delta is tiny
+    assert candidates[1]["status"] == "evaluated"
+
+
+def test_promotion_without_promotion_config_falls_back_to_default(tmp_path):
+    """Without promotion config, any improvement should still promote."""
+    project_dir = _write_demo_project(tmp_path)
+    counter_file = tmp_path / "dataset-counter.txt"
+    manager = AutoResearchManager(base_dir=tmp_path / "autoresearch")
+
+    manifest = _build_manifest(project_dir, counter_file, max_iterations=1)
+    # No promotion config at all — should use default is_better_metric behavior
+    manifest.pop("promotion", None)
+
+    run = manager.create_run(name="Default promo", manifest=manifest, autostart=True)
+    completed = manager.wait_for_status(run["id"], ["completed"], timeout=5.0)
+    assert completed is not None
+
+    candidates = manager.list_candidates(run["id"])
+    assert len(candidates) == 1
+    # First candidate with any metric beats None, so it should promote
+    assert candidates[0]["status"] == "promoted"
