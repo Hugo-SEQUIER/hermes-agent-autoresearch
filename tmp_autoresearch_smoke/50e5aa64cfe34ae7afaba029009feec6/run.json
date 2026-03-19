@@ -1,0 +1,20 @@
+{
+  "created_at": "2026-03-19T15:39:33.359436+00:00",
+  "current_iteration": 0,
+  "event_count": 5,
+  "goal": "Verify runtime wiring",
+  "id": "50e5aa64cfe34ae7afaba029009feec6",
+  "last_error": null,
+  "last_operator_message_at": "2026-03-19T15:39:33.381852+00:00",
+  "manifest": null,
+  "max_iterations": 25,
+  "metadata": {},
+  "mutation_request_count": 1,
+  "notes": "",
+  "operator_message_count": 1,
+  "phase": "running",
+  "report_count": 1,
+  "status": "running",
+  "title": "Smoke",
+  "updated_at": "2026-03-19T15:39:33.391005+00:00"
+}

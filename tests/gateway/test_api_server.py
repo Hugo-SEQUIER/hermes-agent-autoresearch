@@ -12,6 +12,7 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -190,25 +191,20 @@ class TestAuth:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "") -> APIServerAdapter:
+def _make_adapter(api_key: str = "", research_home=None) -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
     if api_key:
         extra["key"] = api_key
+    if research_home is not None:
+        extra["research_home"] = str(research_home)
     config = PlatformConfig(enabled=True, extra=extra)
     return APIServerAdapter(config)
 
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    app = web.Application(middlewares=[cors_middleware])
-    app.router.add_get("/health", adapter._handle_health)
-    app.router.add_get("/v1/models", adapter._handle_models)
-    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
-    app.router.add_post("/v1/responses", adapter._handle_responses)
-    app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
-    app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
-    return app
+    return adapter._build_app()
 
 
 @pytest.fixture
@@ -219,6 +215,11 @@ def adapter():
 @pytest.fixture
 def auth_adapter():
     return _make_adapter(api_key="sk-secret")
+
+
+@pytest.fixture
+def research_adapter(tmp_path):
+    return _make_adapter(research_home=tmp_path / "autoresearch-data")
 
 
 # ---------------------------------------------------------------------------
@@ -1297,3 +1298,154 @@ class TestConversationParameter:
                 assert resp.status == 200
                 # Conversation mapping should NOT be set since store=false
                 assert "ephemeral-chat" not in adapter._conversations
+
+
+# ---------------------------------------------------------------------------
+# Research API
+# ---------------------------------------------------------------------------
+
+
+class TestResearchAPI:
+    @pytest.mark.asyncio
+    async def test_create_list_and_get_run(self, research_adapter):
+        app = _create_app(research_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/research/runs",
+                json={
+                    "name": "Baseline search",
+                    "goal": "Improve evaluation robustness",
+                    "autostart": True,
+                    "manifest": {
+                        "name": "generic-project",
+                        "objective": "Find stronger candidates",
+                        "fixed_surface": ["evaluate.py"],
+                        "mutable_surface": ["train.py"],
+                    },
+                },
+            )
+            assert resp.status == 201
+            created = await resp.json()
+            run = created["data"]
+            assert run["name"] == "Baseline search"
+            assert run["status"] == "running"
+            assert run["manifest"]["name"] == "generic-project"
+
+            list_resp = await cli.get("/api/research/runs")
+            assert list_resp.status == 200
+            listed = await list_resp.json()
+            assert any(item["id"] == run["id"] for item in listed["data"])
+
+            get_resp = await cli.get(f"/api/research/runs/{run['id']}")
+            assert get_resp.status == 200
+            fetched = await get_resp.json()
+            assert fetched["data"]["id"] == run["id"]
+            assert fetched["data"]["manifest"]["mutable_surface"] == ["train.py"]
+
+    @pytest.mark.asyncio
+    async def test_research_controls_and_operator_actions(self, research_adapter):
+        app = _create_app(research_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post(
+                "/api/research/runs",
+                json={"name": "Control test", "autostart": True},
+            )
+            run_id = (await create_resp.json())["data"]["id"]
+
+            pause_resp = await cli.post(f"/api/research/runs/{run_id}/pause")
+            assert pause_resp.status == 200
+            paused = await pause_resp.json()
+            assert paused["data"]["status"] == "paused"
+
+            chat_resp = await cli.post(
+                f"/api/research/runs/{run_id}/chat",
+                json={"message": "Focus on robustness first", "scope": "run"},
+            )
+            assert chat_resp.status == 200
+            chat_payload = await chat_resp.json()
+            assert chat_payload["data"]["event_type"] == "operator.message"
+            assert chat_payload["run"]["control"]["last_operator_message_at"] is not None
+
+            mutation_resp = await cli.post(
+                f"/api/research/runs/{run_id}/request-mutation",
+                json={"reason": "Need a fresh candidate"},
+            )
+            assert mutation_resp.status == 200
+            mutation_payload = await mutation_resp.json()
+            assert mutation_payload["data"]["event_type"] == "mutation.requested"
+            assert mutation_payload["run"]["requested_mutation_count"] == 1
+
+            resume_resp = await cli.post(f"/api/research/runs/{run_id}/resume")
+            assert resume_resp.status == 200
+            resumed = await resume_resp.json()
+            assert resumed["data"]["status"] == "running"
+
+            stop_resp = await cli.post(f"/api/research/runs/{run_id}/stop")
+            assert stop_resp.status == 200
+            stopped = await stop_resp.json()
+            assert stopped["data"]["status"] == "stopped"
+
+    @pytest.mark.asyncio
+    async def test_research_events_stream_once(self, research_adapter):
+        app = _create_app(research_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post(
+                "/api/research/runs",
+                json={"name": "Stream test", "autostart": True},
+            )
+            run_id = (await create_resp.json())["data"]["id"]
+            await cli.post(
+                f"/api/research/runs/{run_id}/chat",
+                json={"message": "Please write a better report"},
+            )
+
+            stream_resp = await cli.get(f"/api/research/runs/{run_id}/events?once=true")
+            assert stream_resp.status == 200
+            text = await stream_resp.text()
+            assert "event: research.event" in text
+            assert "run.created" in text
+            assert "operator.message" in text
+
+    @pytest.mark.asyncio
+    async def test_autostart_run_reaches_completed_state(self, research_adapter):
+        app = _create_app(research_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post(
+                "/api/research/runs",
+                json={
+                    "name": "Auto loop",
+                    "goal": "Run one iteration",
+                    "autostart": True,
+                    "max_iterations": 1,
+                },
+            )
+            assert create_resp.status == 201
+            run_id = (await create_resp.json())["data"]["id"]
+
+            deadline = time.time() + 3.0
+            final = None
+            while time.time() < deadline:
+                resp = await cli.get(f"/api/research/runs/{run_id}")
+                assert resp.status == 200
+                final = await resp.json()
+                if final["data"]["status"] == "completed":
+                    break
+                await asyncio.sleep(0.05)
+
+            assert final is not None
+            assert final["data"]["status"] == "completed"
+
+            candidates_resp = await cli.get(f"/api/research/runs/{run_id}/candidates")
+            metrics_resp = await cli.get(f"/api/research/runs/{run_id}/metrics")
+            assert candidates_resp.status == 200
+            assert metrics_resp.status == 200
+            assert len((await candidates_resp.json())["data"]) == 1
+            assert len((await metrics_resp.json())["data"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_research_endpoints_require_auth(self, tmp_path):
+        adapter = _make_adapter(api_key="sk-secret", research_home=tmp_path / "research-data")
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/research/runs", json={"name": "Blocked"})
+            assert resp.status == 401

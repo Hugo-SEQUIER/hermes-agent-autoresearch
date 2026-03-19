@@ -24,6 +24,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -37,6 +38,12 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+)
+from autoresearch.runtime import (
+    AutoResearchManager,
+    InvalidRunStateError,
+    RunNotFoundError,
+    TERMINAL_RUN_STATUSES,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,6 +140,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        research_home = extra.get("research_home")
+        self._research_manager = AutoResearchManager(
+            base_dir=Path(research_home) if research_home else None
+        )
         # Conversation name → latest response_id mapping
         self._conversations: Dict[str, str] = {}
 
@@ -160,6 +171,57 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    @staticmethod
+    def _json_error(message: str, *, status: int = 400, code: Optional[str] = None) -> "web.Response":
+        error = {"message": message, "type": "invalid_request_error"}
+        if code:
+            error["code"] = code
+        return web.json_response({"error": error}, status=status)
+
+    @staticmethod
+    def _parse_bool(value: Any, *, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    async def _parse_json_body(self, request: "web.Request") -> Dict[str, Any]:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception) as exc:
+            raise ValueError("Invalid JSON in request body") from exc
+        if not isinstance(body, dict):
+            raise ValueError("JSON request body must be an object")
+        return body
+
+    def _build_app(self) -> "web.Application":
+        app = web.Application(middlewares=[cors_middleware])
+        self._register_routes(app)
+        return app
+
+    def _register_routes(self, app: "web.Application") -> None:
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/v1/models", self._handle_models)
+        app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+        app.router.add_post("/v1/responses", self._handle_responses)
+        app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
+        app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+        app.router.add_get("/api/research/runs", self._handle_research_runs_list)
+        app.router.add_post("/api/research/runs", self._handle_research_runs_create)
+        app.router.add_get("/api/research/runs/{run_id}", self._handle_research_run_get)
+        app.router.add_get("/api/research/runs/{run_id}/events", self._handle_research_run_events)
+        app.router.add_get("/api/research/runs/{run_id}/reports", self._handle_research_run_reports)
+        app.router.add_get("/api/research/runs/{run_id}/candidates", self._handle_research_run_candidates)
+        app.router.add_get("/api/research/runs/{run_id}/metrics", self._handle_research_run_metrics)
+        app.router.add_post("/api/research/runs/{run_id}/pause", self._handle_research_run_pause)
+        app.router.add_post("/api/research/runs/{run_id}/resume", self._handle_research_run_resume)
+        app.router.add_post("/api/research/runs/{run_id}/stop", self._handle_research_run_stop)
+        app.router.add_post("/api/research/runs/{run_id}/chat", self._handle_research_run_chat)
+        app.router.add_post("/api/research/runs/{run_id}/request-mutation", self._handle_research_run_request_mutation)
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -427,6 +489,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    async def _write_sse_research_event(
+        self,
+        response: "web.StreamResponse",
+        event: Dict[str, Any],
+    ) -> None:
+        payload = json.dumps(event)
+        await response.write(f"id: {event['seq']}\n".encode())
+        await response.write(b"event: research.event\n")
+        await response.write(f"data: {payload}\n\n".encode())
+
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
         auth_err = self._check_auth(request)
@@ -630,6 +702,243 @@ class APIServerAdapter(BasePlatformAdapter):
             "deleted": True,
         })
 
+    async def _handle_research_runs_list(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        limit = request.query.get("limit")
+        try:
+            limit_value = int(limit) if limit else None
+        except ValueError:
+            return self._json_error("Query param 'limit' must be an integer")
+
+        runs = self._research_manager.list_runs(limit=limit_value)
+        return web.json_response({"object": "list", "data": runs})
+
+    async def _handle_research_runs_create(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await self._parse_json_body(request)
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        manifest = body.get("manifest")
+        metadata = body.get("metadata") or {}
+        if manifest is not None and not isinstance(manifest, dict):
+            return self._json_error("'manifest' must be an object")
+        if not isinstance(metadata, dict):
+            return self._json_error("'metadata' must be an object")
+
+        try:
+            run = self._research_manager.create_run(
+                name=body.get("name"),
+                goal=str(body.get("goal") or ""),
+                manifest_path=body.get("manifest_path"),
+                manifest=manifest,
+                metadata=metadata,
+                max_iterations=body.get("max_iterations"),
+                autostart=self._parse_bool(body.get("autostart"), default=False),
+            )
+        except FileNotFoundError as exc:
+            return self._json_error(str(exc), status=404)
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        return web.json_response({"object": "research.run", "data": run}, status=201)
+
+    async def _handle_research_run_get(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            run = self._research_manager.get_run(run_id)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "research.run", "data": run})
+
+    async def _handle_research_run_reports(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            reports = self._research_manager.list_reports(run_id)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "list", "data": reports})
+
+    async def _handle_research_run_candidates(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            candidates = self._research_manager.list_candidates(run_id)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "list", "data": candidates})
+
+    async def _handle_research_run_metrics(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            metrics = self._research_manager.list_metrics(run_id)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "list", "data": metrics})
+
+    async def _handle_research_run_pause(self, request: "web.Request") -> "web.Response":
+        return await self._handle_research_state_change(request, action="pause")
+
+    async def _handle_research_run_resume(self, request: "web.Request") -> "web.Response":
+        return await self._handle_research_state_change(request, action="resume")
+
+    async def _handle_research_run_stop(self, request: "web.Request") -> "web.Response":
+        return await self._handle_research_state_change(request, action="stop")
+
+    async def _handle_research_state_change(self, request: "web.Request", *, action: str) -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            if action == "pause":
+                run = self._research_manager.pause_run(run_id)
+            elif action == "resume":
+                run = self._research_manager.resume_run(run_id)
+            elif action == "stop":
+                run = self._research_manager.stop_run(run_id)
+            else:
+                return self._json_error(f"Unsupported action: {action}", status=500)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+        except InvalidRunStateError as exc:
+            return self._json_error(str(exc), status=409)
+
+        return web.json_response({"object": "research.run", "data": run})
+
+    async def _handle_research_run_chat(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await self._parse_json_body(request)
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        try:
+            event = self._research_manager.add_operator_message(
+                run_id,
+                content=str(body.get("message") or ""),
+                scope=str(body.get("scope") or "run"),
+                author=str(body.get("author") or "operator"),
+            )
+            run = self._research_manager.get_run(run_id, include_manifest=False)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        return web.json_response({"object": "research.event", "data": event, "run": run})
+
+    async def _handle_research_run_request_mutation(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            body = await self._parse_json_body(request)
+        except ValueError:
+            body = {}
+
+        try:
+            event = self._research_manager.request_mutation(
+                run_id,
+                reason=str(body.get("reason") or ""),
+            )
+            run = self._research_manager.get_run(run_id, include_manifest=False)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        return web.json_response({"object": "research.event", "data": event, "run": run})
+
+    async def _handle_research_run_events(self, request: "web.Request") -> "web.StreamResponse":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        try:
+            self._research_manager.get_run(run_id, include_manifest=False)
+        except RunNotFoundError:
+            return self._json_error(f"Research run not found: {run_id}", status=404)
+
+        after_raw = request.query.get("after", "0")
+        try:
+            after_seq = int(after_raw)
+        except ValueError:
+            return self._json_error("Query param 'after' must be an integer")
+
+        once = self._parse_bool(request.query.get("once"), default=False)
+        response = web.StreamResponse(
+            status=200,
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+        )
+        await response.prepare(request)
+
+        await response.write(f": run {run_id}\n\n".encode())
+
+        current_events = self._research_manager.list_events(run_id, after_seq=after_seq)
+        for event in current_events:
+            after_seq = event["seq"]
+            await self._write_sse_research_event(response, event)
+
+        if once:
+            await response.write_eof()
+            return response
+
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                has_new = await loop.run_in_executor(
+                    None,
+                    lambda: self._research_manager.wait_for_events(run_id, after_seq, 15.0),
+                )
+                if not has_new:
+                    run = self._research_manager.get_run(run_id, include_manifest=False)
+                    if run["status"] in TERMINAL_RUN_STATUSES:
+                        break
+                    await response.write(b": keep-alive\n\n")
+                    continue
+
+                for event in self._research_manager.list_events(run_id, after_seq=after_seq):
+                    after_seq = event["seq"]
+                    await self._write_sse_research_event(response, event)
+        except (ConnectionResetError, RuntimeError):
+            return response
+
+        await response.write_eof()
+        return response
+
     # ------------------------------------------------------------------
     # Output extraction helper
     # ------------------------------------------------------------------
@@ -732,13 +1041,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            self._app = web.Application(middlewares=[cors_middleware])
-            self._app.router.add_get("/health", self._handle_health)
-            self._app.router.add_get("/v1/models", self._handle_models)
-            self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
-            self._app.router.add_post("/v1/responses", self._handle_responses)
-            self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
-            self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            self._app = self._build_app()
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
