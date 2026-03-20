@@ -5,8 +5,8 @@ import { usePathname } from "next/navigation";
 import { Icon } from "./Icon";
 
 const SIDEBAR_ITEMS = [
-  { icon: "smart_toy", label: "Active Runs", href: "/" },
-  { icon: "history", label: "Run History", href: "/runs" },
+  { icon: "chat", label: "Dashboard", href: "/" },
+  { icon: "history", label: "All Runs", href: "/runs" },
 ];
 
 export function Sidebar() {

@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { Shell } from "@/components/Shell";
 import { Icon } from "@/components/Icon";
+import ChatPanel from "@/components/ChatPanel";
 import { listRuns, Run, controlRun } from "@/lib/api";
 import { usePolling } from "@/lib/useSSE";
 
@@ -45,9 +46,8 @@ function RunCard({ run }: { run: Run }) {
 
   return (
     <Link href={`/runs/${run.id}`} className="block">
-      <div className="bg-surface-container-low p-6 rounded-lg border-t-2 border-primary/30 hover:bg-surface-container-highest transition-all">
-        {/* Title + status */}
-        <div className="flex items-center justify-between gap-3 mb-3">
+      <div className="bg-surface-container-low p-4 rounded-lg border-l-2 border-primary/30 hover:bg-surface-container-highest transition-all">
+        <div className="flex items-center justify-between gap-2 mb-2">
           <h3 className="font-headline text-sm font-semibold text-on-surface truncate">
             {run.title}
           </h3>
@@ -60,36 +60,27 @@ function RunCard({ run }: { run: Run }) {
           </span>
         </div>
 
-        {/* Phase */}
-        <p className="text-[10px] font-label uppercase text-outline mb-3">
-          {run.phase}
-        </p>
-
-        {/* Progress bar */}
-        <div className="mb-3">
+        <div className="mb-2">
           <div className="flex items-center justify-between mb-1">
-            <span className="text-[10px] text-outline">Progress</span>
+            <span className="text-[10px] text-outline">{run.phase}</span>
             <span className="text-[10px] text-outline">
               {run.current_iteration}/{run.max_iterations}
             </span>
           </div>
-          <div className="h-1.5 bg-surface-container-highest rounded-full">
+          <div className="h-1 bg-surface-container-highest rounded-full">
             <div
-              className="h-full bg-secondary-container shadow-[0_0_15px_rgba(255,191,0,0.4)] rounded-full transition-all"
+              className="h-full bg-secondary-container rounded-full transition-all"
               style={{ width: `${Math.min(progress, 100)}%` }}
             />
           </div>
         </div>
 
-        {/* Goal */}
-        <p className="text-xs text-outline line-clamp-2 mb-3">{run.goal}</p>
+        <p className="text-xs text-outline line-clamp-1 mb-2">{run.goal}</p>
 
-        {/* Footer: timestamp + controls */}
         <div className="flex items-center justify-between">
           <span className="text-[10px] text-outline">
             {formatDate(run.created_at)}
           </span>
-
           <div className="flex items-center gap-1">
             {run.status === "running" && (
               <button
@@ -97,7 +88,7 @@ function RunCard({ run }: { run: Run }) {
                 className="text-on-surface-variant hover:text-primary transition-colors"
                 title="Pause"
               >
-                <Icon name="pause" className="text-base" />
+                <Icon name="pause" className="text-sm" />
               </button>
             )}
             {run.status === "paused" && (
@@ -106,7 +97,7 @@ function RunCard({ run }: { run: Run }) {
                 className="text-on-surface-variant hover:text-primary transition-colors"
                 title="Resume"
               >
-                <Icon name="play_arrow" className="text-base" />
+                <Icon name="play_arrow" className="text-sm" />
               </button>
             )}
             {(run.status === "running" || run.status === "paused") && (
@@ -115,7 +106,7 @@ function RunCard({ run }: { run: Run }) {
                 className="text-on-surface-variant hover:text-error transition-colors"
                 title="Stop"
               >
-                <Icon name="stop" className="text-base" />
+                <Icon name="stop" className="text-sm" />
               </button>
             )}
           </div>
@@ -131,37 +122,48 @@ export default function HomePage() {
 
   return (
     <Shell>
-      <div className="p-8 max-w-6xl mx-auto">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-8">
-          <h1 className="font-headline text-2xl font-bold tracking-tight text-on-surface">
-            Active Synthesis
-          </h1>
-          <Link
-            href="/runs"
-            className="inline-flex items-center gap-2 px-4 py-2 text-outline hover:text-primary text-sm font-label transition-colors"
-          >
-            <Icon name="history" className="text-lg" />
-            All Runs
-          </Link>
+      <div className="flex h-full overflow-hidden">
+        {/* Left panel — Chat with Hermes */}
+        <div className="flex w-full lg:w-1/2 xl:w-2/5">
+          <ChatPanel />
         </div>
 
-        {/* Run grid */}
-        {runs.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {runs.map((run) => (
-              <RunCard key={run.id} run={run} />
-            ))}
+        {/* Right panel — Active runs */}
+        <div className="hidden lg:block lg:w-1/2 xl:w-3/5 overflow-y-auto border-l border-outline-variant/20">
+          <div className="p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="font-headline text-lg font-bold tracking-tight text-on-surface">
+                Active Runs
+              </h2>
+              <Link
+                href="/runs"
+                className="inline-flex items-center gap-1 text-xs text-outline hover:text-primary font-label uppercase tracking-widest transition-colors"
+              >
+                <Icon name="history" className="text-sm" />
+                All Runs
+              </Link>
+            </div>
+
+            {runs.length > 0 ? (
+              <div className="space-y-3">
+                {runs.map((run) => (
+                  <RunCard key={run.id} run={run} />
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-lg p-8 text-center bg-surface-container-low">
+                <Icon
+                  name="science"
+                  className="text-3xl text-outline mb-2 block mx-auto"
+                />
+                <p className="text-outline text-sm mb-1">No research runs yet</p>
+                <p className="text-outline/50 text-xs">
+                  Ask Hermes to start a new research run
+                </p>
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="glass-panel rounded-lg p-12 text-center">
-            <Icon
-              name="science"
-              className="text-4xl text-outline mb-3 block mx-auto"
-            />
-            <p className="text-outline text-sm">No active research runs</p>
-          </div>
-        )}
+        </div>
       </div>
     </Shell>
   );
