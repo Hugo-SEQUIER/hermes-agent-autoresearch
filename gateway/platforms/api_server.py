@@ -447,7 +447,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         response = web.StreamResponse(
             status=200,
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                **_CORS_HEADERS,
+            },
         )
         await response.prepare(request)
 
@@ -990,7 +994,11 @@ class APIServerAdapter(BasePlatformAdapter):
         once = self._parse_bool(request.query.get("once"), default=False)
         response = web.StreamResponse(
             status=200,
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                **_CORS_HEADERS,
+            },
         )
         await response.prepare(request)
 
