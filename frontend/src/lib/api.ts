@@ -174,6 +174,84 @@ export function requestMutation(
   });
 }
 
+/* ── Interactive Chat (via /v1/chat/completions) ── */
+
+export interface CompletionMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Send a conversation to Hermes and stream the response token-by-token.
+ * Calls the OpenAI-compatible /v1/chat/completions endpoint with stream=true.
+ * Returns the full assistant message once the stream is done.
+ */
+export async function chatWithHermes(
+  messages: CompletionMessage[],
+  onDelta: (token: string) => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  const url = `${API_BASE}/v1/chat/completions`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const apiKey = process.env.NEXT_PUBLIC_API_KEY;
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: "hermes-agent",
+      messages,
+      stream: true,
+    }),
+    signal,
+  });
+
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${await res.text()}`);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let full = "";
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6);
+      if (payload === "[DONE]") continue;
+
+      try {
+        const parsed = JSON.parse(payload);
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (delta) {
+          full += delta;
+          onDelta(delta);
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+
+  return full;
+}
+
 /* ── Iterations / Mutation Audit ── */
 
 export function listIterations(
