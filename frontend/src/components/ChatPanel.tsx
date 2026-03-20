@@ -93,7 +93,7 @@ export default function ChatPanel({ runId, runTitle }: ChatPanelProps) {
   const title = scope === "run" && runTitle ? runTitle : "Hermes Workspace";
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full w-full">
       {/* ── Header ── */}
       <div className="p-6 border-b border-outline-variant/10 flex justify-between items-center">
         <div>
