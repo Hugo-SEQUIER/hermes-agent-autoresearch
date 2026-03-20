@@ -32,6 +32,11 @@ source-data/*
 run_datagen_megascience_glm4-6.sh
 data/*
 node_modules/
+
+# Frontend (Next.js)
+frontend/.next/
+frontend/out/
+frontend/node_modules/
 browser-use/
 agent-browser/
 # Private keys

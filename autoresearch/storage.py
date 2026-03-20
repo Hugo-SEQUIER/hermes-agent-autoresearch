@@ -184,6 +184,40 @@ class AutoResearchStore:
                     results.append(OperatorMessage.from_dict(json.loads(line)))
             return results
 
+    def append_global_message(
+        self,
+        *,
+        content: str,
+        scope: str = "global",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> OperatorMessage:
+        """Append a global operator message (not tied to any run)."""
+        with self._lock:
+            message = OperatorMessage(
+                id=uuid.uuid4().hex,
+                run_id="",
+                content=content.strip(),
+                scope="global",
+                metadata=dict(metadata or {}),
+            )
+            self._append_jsonl(self._global_messages_file(), message.to_dict())
+            return message
+
+    def list_global_messages(self) -> List[OperatorMessage]:
+        """Return global operator messages."""
+        path = self._global_messages_file()
+        with self._lock:
+            if not path.exists():
+                return []
+            results: List[OperatorMessage] = []
+            with open(path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    results.append(OperatorMessage.from_dict(json.loads(line)))
+            return results
+
     def write_report(
         self,
         run_id: str,
@@ -383,6 +417,9 @@ class AutoResearchStore:
 
     def _report_file(self, run_id: str, report_id: str) -> Path:
         return self._reports_dir(run_id) / f"{report_id}.json"
+
+    def _global_messages_file(self) -> Path:
+        return self.root / "global_messages.jsonl"
 
     def _candidates_file(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "candidates.jsonl"

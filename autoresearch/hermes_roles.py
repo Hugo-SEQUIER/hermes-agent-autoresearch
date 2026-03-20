@@ -254,6 +254,17 @@ class HermesRoleRunner:
                 "- End with a concise summary of the exact edits performed.",
                 "",
             ]
+        if role_name == "planner":
+            op_messages = list(payload.get("recent_operator_messages") or [])
+            if op_messages:
+                instructions.extend([
+                    "Operator guidance (incorporate into your plan):",
+                ])
+                for msg in op_messages:
+                    author = msg.get("author", "operator")
+                    content = msg.get("content", "")
+                    instructions.append(f"  - [{author}]: {content}")
+                instructions.append("")
         header = [
             f"AutoResearch role: {role_name}",
             f"Run: {run.title}",
@@ -273,8 +284,16 @@ class HermesRoleRunner:
             return (
                 "You are Hermes acting as the planner role inside an AutoResearch loop. "
                 "Use only the provided context unless tools were explicitly enabled. "
+                "If operator guidance is present, treat it as high-priority input and reflect it in your plan. "
                 "Produce a concise markdown plan that identifies the current hypothesis, "
                 "the most important next action, and the main risks to watch."
+            )
+        if role_name == "researcher":
+            return (
+                "You are Hermes acting as the researcher role inside an AutoResearch loop. "
+                "Analyze the current metrics, candidate history, and operator guidance to "
+                "identify promising hypotheses, unexplored data directions, and potential "
+                "angles for the next mutation. Be specific and concise."
             )
         if role_name == "mutator":
             return (
@@ -282,6 +301,23 @@ class HermesRoleRunner:
                 "You may edit only the allowed mutable files in the provided workspace. "
                 "Never modify fixed-surface files. Keep changes minimal, targeted, and comparable. "
                 "When finished, summarize exactly what you changed and why."
+            )
+        if role_name == "orchestrator":
+            return (
+                "You are Hermes acting as the orchestrator role inside an AutoResearch loop. "
+                "Decide which specialized roles should be active for this iteration based on the "
+                "current state: metrics trend, iteration number, recent failures, and operator guidance. "
+                "Output a JSON object with keys: researcher (bool), critic (bool), and strategy (string). "
+                "The strategy field should be a one-sentence explanation of your delegation decision. "
+                "Keep delegation depth limited — not every iteration needs every role."
+            )
+        if role_name == "critic":
+            return (
+                "You are Hermes acting as the critic role inside an AutoResearch loop. "
+                "Examine the latest evaluation results, metric trends, and mutation changes "
+                "to identify signs of overfitting, regressions, weak validation, or suspicious "
+                "improvements. Be skeptical and specific. Flag concrete concerns with evidence "
+                "from the data."
             )
         return (
             "You are Hermes acting as the reporter role inside an AutoResearch loop. "

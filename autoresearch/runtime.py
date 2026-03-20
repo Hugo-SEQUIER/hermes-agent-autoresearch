@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -314,6 +317,21 @@ class AutoResearchManager:
             },
         )
 
+    def add_global_message(
+        self, *, content: str, author: str = "operator"
+    ) -> Dict[str, Any]:
+        content = str(content or "").strip()
+        if not content:
+            raise ValueError("Missing required field: message")
+        message = self.store.append_global_message(
+            content=content,
+            metadata={"author": author},
+        )
+        return message.to_dict()
+
+    def list_global_messages(self) -> List[Dict[str, Any]]:
+        return [m.to_dict() for m in self.store.list_global_messages()]
+
     def request_mutation(self, run_id: str, *, reason: str = "") -> Dict[str, Any]:
         run = self.store.increment_mutation_requests(run_id)
         return self._emit_event(
@@ -530,6 +548,74 @@ class AutoResearchManager:
             recent_messages=recent_messages,
             mutation_requests=mutation_requests,
         )
+
+        # --- Orchestrator: decide which roles to activate this iteration ---
+        delegation: Dict[str, Any] = {"researcher": True, "critic": True, "strategy": ""}
+        orchestrator_role = self._invoke_role(
+            role_name="orchestrator",
+            run=run,
+            iteration=iteration,
+            context=context,
+            payload={
+                "run": self._serialize_run(run),
+                "iteration": iteration,
+                "max_iterations": run.max_iterations,
+                "progress_ratio": round(iteration / max(1, run.max_iterations), 4),
+                "recent_candidates": self._recent_candidates(run_id, limit=3),
+                "recent_metrics": self._recent_metrics(run_id, limit=12),
+                "recent_operator_messages": recent_messages,
+            },
+        )
+        if orchestrator_role and orchestrator_role.status == "completed" and orchestrator_role.content:
+            try:
+                parsed = json.loads(orchestrator_role.content.strip())
+                if isinstance(parsed, dict):
+                    delegation["researcher"] = bool(parsed.get("researcher", True))
+                    delegation["critic"] = bool(parsed.get("critic", True))
+                    delegation["strategy"] = str(parsed.get("strategy", ""))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass  # keep defaults: run all roles
+        self.append_event(
+            run_id,
+            "orchestrator.completed",
+            message=f"Orchestrator finished iteration {iteration}",
+            data={
+                "iteration": iteration,
+                "delegation": delegation,
+                "role": orchestrator_role.to_dict() if orchestrator_role else None,
+            },
+        )
+
+        if delegation.get("researcher", True):
+            researcher_role = self._invoke_role(
+                role_name="researcher",
+                run=run,
+                iteration=iteration,
+                context=context,
+                payload={
+                    "run": self._serialize_run(run),
+                    "workspace": workspace.to_dict(),
+                    "recent_operator_messages": recent_messages,
+                    "recent_candidates": self._recent_candidates(run_id, limit=5),
+                    "recent_metrics": self._recent_metrics(run_id, limit=20),
+                    "plan_summary": plan_summary,
+                },
+            )
+        else:
+            researcher_role = None
+        research_summary = ""
+        if researcher_role and researcher_role.status == "completed" and researcher_role.content:
+            research_summary = researcher_role.content.strip()
+        self.append_event(
+            run_id,
+            "researcher.completed",
+            message=f"Researcher finished iteration {iteration}",
+            data={
+                "iteration": iteration,
+                "research_summary": research_summary,
+                "role": researcher_role.to_dict() if researcher_role else None,
+            },
+        )
         planner_role = self._invoke_role(
             role_name="planner",
             run=run,
@@ -539,9 +625,11 @@ class AutoResearchManager:
                 "run": self._serialize_run(run),
                 "workspace": workspace.to_dict(),
                 "recent_operator_messages": recent_messages,
+                "has_operator_guidance": bool(recent_messages),
                 "recent_candidates": self._recent_candidates(run_id, limit=3),
                 "recent_metrics": self._recent_metrics(run_id, limit=12),
                 "mutation_request_count": mutation_requests,
+                "research_summary": research_summary,
             },
         )
         if planner_role and planner_role.status == "completed" and planner_role.content:
@@ -571,6 +659,52 @@ class AutoResearchManager:
             skip_reason="no dataset command configured",
             once_per_run=bool((manifest.get("dataset") or {}).get("once", True)),
         )
+
+        # --- Dataset snapshot reproducibility ---
+        dataset_cfg = manifest.get("dataset") or {}
+        if isinstance(dataset_cfg, Mapping) and dataset_cfg.get("snapshot", False):
+            ds_path = dataset_cfg.get("path")
+            dataset_dir = Path(ds_path) if ds_path else Path(workspace.workspace_dir) / "data"
+            if dataset_dir.is_dir():
+                hash_hex, file_count = self._compute_dataset_hash(dataset_dir)
+                if iteration == 1:
+                    # First iteration: record the baseline snapshot
+                    self.add_metric(
+                        run_id,
+                        iteration=iteration,
+                        name="dataset.snapshot_hash",
+                        value=0.0,
+                        data={"hash": hash_hex, "file_count": file_count, "phase": "dataset"},
+                    )
+                    self._emit_event(
+                        run_id,
+                        "dataset.snapshot",
+                        {
+                            "iteration": iteration,
+                            "hash": hash_hex,
+                            "file_count": file_count,
+                            "dataset_dir": str(dataset_dir),
+                        },
+                    )
+                else:
+                    # Subsequent iterations: check for drift
+                    stored_hash: str | None = None
+                    for m in self.store.list_metrics(run_id):
+                        if m.name == "dataset.snapshot_hash" and m.iteration == 1:
+                            stored_hash = (m.metadata or {}).get("hash")
+                            break
+                    if stored_hash and hash_hex != stored_hash:
+                        self._emit_event(
+                            run_id,
+                            "dataset.drift_detected",
+                            {
+                                "iteration": iteration,
+                                "old_hash": stored_hash,
+                                "new_hash": hash_hex,
+                                "dataset_dir": str(dataset_dir),
+                            },
+                        )
+
         if not self._should_continue(run_id):
             return
 
@@ -614,17 +748,49 @@ class AutoResearchManager:
         if not self._should_continue(run_id):
             return
 
+        isolate_eval = manifest.get("evaluation", {}).get("isolate", False)
+        eval_workspace = workspace
+        eval_workspace_dir: Optional[Path] = None
+
+        if isolate_eval:
+            eval_workspace_dir = Path(workspace.iteration_dir) / "eval_workspace"
+            shutil.copytree(
+                workspace.workspace_dir,
+                str(eval_workspace_dir),
+                dirs_exist_ok=True,
+            )
+            eval_workspace = WorkspaceSetup(
+                source_root=workspace.source_root,
+                workspace_dir=str(eval_workspace_dir),
+                iteration_dir=workspace.iteration_dir,
+                snapshot_enabled=workspace.snapshot_enabled,
+                copied_paths=list(workspace.copied_paths),
+            )
+            self._emit_event(
+                run_id,
+                "evaluation.isolated",
+                {"eval_workspace_dir": str(eval_workspace_dir)},
+            )
+
         evaluation_result = self._run_manifest_phase(
             run_id=run_id,
             iteration=iteration,
             phase="evaluation",
             config=manifest.get("evaluation"),
             context=context,
-            workspace=workspace,
+            workspace=eval_workspace,
             command_keys=("command", "evaluate_command"),
             skip_reason="no evaluation command configured",
             once_per_run=False,
         )
+
+        if isolate_eval and eval_workspace_dir is not None:
+            if evaluation_result is not None and evaluation_result.returncode == 0:
+                for artifact_name in ("metrics.json", "summary.txt"):
+                    src = eval_workspace_dir / artifact_name
+                    if src.exists():
+                        shutil.copy2(str(src), workspace.workspace_dir)
+
         if not self._should_continue(run_id):
             return
 
@@ -690,6 +856,46 @@ class AutoResearchManager:
             data={"phase": "reporting"},
         )
 
+        critique = None
+        if delegation.get("critic", True):
+            critic_role = self._invoke_role(
+                role_name="critic",
+                run=self._load_run(run_id),
+                iteration=iteration,
+                context=context,
+                payload={
+                    "run": self._serialize_run(self._load_run(run_id)),
+                    "workspace": workspace.to_dict(),
+                    "candidate_status": candidate_status,
+                    "metrics": metrics,
+                    "primary_metric": self._compact_dict(
+                        {
+                            "name": primary_metric_name,
+                            "value": primary_metric_value,
+                            "higher_is_better": higher_is_better if primary_metric_name else None,
+                        }
+                    ),
+                    "plan_summary": plan_summary,
+                    "mutation_audit": mutation_audit,
+                    "recent_candidates": self._recent_candidates(run_id, limit=5),
+                    "recent_metrics": self._recent_metrics(run_id, limit=20),
+                },
+            )
+        else:
+            critic_role = None
+        if critic_role and critic_role.status == "completed" and critic_role.content:
+            critique = critic_role.content.strip()
+        self.append_event(
+            run_id,
+            "critic.completed",
+            message=f"Critic finished iteration {iteration}",
+            data={
+                "iteration": iteration,
+                "critique": critique,
+                "role": critic_role.to_dict() if critic_role else None,
+            },
+        )
+
         candidate_summary = self._build_candidate_summary(
             iteration=iteration,
             primary_metric_name=primary_metric_name,
@@ -728,8 +934,16 @@ class AutoResearchManager:
                 "mutation_requests_seen": mutation_requests,
                 "roles": self._compact_dict(
                     {
+                        "orchestrator": self._compact_dict(
+                            {
+                                "delegation": delegation,
+                                "role": orchestrator_role.to_dict() if orchestrator_role else None,
+                            }
+                        ),
+                        "researcher": researcher_role.to_dict() if researcher_role else None,
                         "planner": planner_role.to_dict() if planner_role else None,
                         "mutator": mutator_role.to_dict() if mutator_role else None,
+                        "critic": critic_role.to_dict() if critic_role else None,
                     }
                 ),
             }
@@ -773,6 +987,7 @@ class AutoResearchManager:
                 "dataset": dataset_result.to_dict() if dataset_result else None,
                 "mutation": mutation_result.to_dict() if mutation_result else None,
                 "evaluation": evaluation_result.to_dict() if evaluation_result else None,
+                "critique": critique,
             },
         )
         if reporter_role and reporter_role.status == "completed" and reporter_role.content:
@@ -1342,6 +1557,29 @@ class AutoResearchManager:
         )
         return mutation_audit
 
+    def _compute_dataset_hash(self, dataset_dir: Path) -> tuple[str, int]:
+        """Compute a combined SHA-256 hash of all files in *dataset_dir*.
+
+        Files are processed in sorted relative-path order for determinism.
+        Returns ``(hex_digest, file_count)``.
+        """
+        hasher = hashlib.sha256()
+        file_count = 0
+        if dataset_dir.is_dir():
+            for file_path in sorted(dataset_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(dataset_dir).as_posix()
+                hasher.update(rel.encode("utf-8"))
+                try:
+                    with open(file_path, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(8192), b""):
+                            hasher.update(chunk)
+                except OSError:
+                    pass
+                file_count += 1
+        return hasher.hexdigest(), file_count
+
     def _invoke_role(
         self,
         *,
@@ -1387,6 +1625,22 @@ class AutoResearchManager:
                     "role": result.to_dict(),
                 },
             )
+            self.append_event(
+                run.id,
+                f"role.{role_name}.completed",
+                message=f"Role '{role_name}' finished with status '{result.status}'",
+                data={
+                    "iteration": iteration,
+                    "role": role_name,
+                    "status": result.status,
+                    "content_preview": (result.content or "")[:500],
+                    "model": result.model,
+                    "usage": result.usage,
+                    "started_at": result.started_at,
+                    "completed_at": result.completed_at,
+                    "error": result.error,
+                },
+            )
             return result
         self.append_event(
             run.id,
@@ -1396,6 +1650,22 @@ class AutoResearchManager:
                 "iteration": iteration,
                 "role": result.to_dict(),
                 "preview": result.content[:300],
+            },
+        )
+        self.append_event(
+            run.id,
+            f"role.{role_name}.completed",
+            message=f"Role '{role_name}' finished with status '{result.status}'",
+            data={
+                "iteration": iteration,
+                "role": role_name,
+                "status": result.status,
+                "content_preview": (result.content or "")[:500],
+                "model": result.model,
+                "usage": result.usage,
+                "started_at": result.started_at,
+                "completed_at": result.completed_at,
+                "error": result.error,
             },
         )
         return result

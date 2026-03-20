@@ -210,6 +210,8 @@ class APIServerAdapter(BasePlatformAdapter):
         app.router.add_post("/v1/responses", self._handle_responses)
         app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
         app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+        app.router.add_post("/api/research/chat", self._handle_research_global_chat_post)
+        app.router.add_get("/api/research/chat", self._handle_research_global_chat_list)
         app.router.add_get("/api/research/runs", self._handle_research_runs_list)
         app.router.add_post("/api/research/runs", self._handle_research_runs_create)
         app.router.add_get("/api/research/runs/{run_id}", self._handle_research_run_get)
@@ -227,6 +229,27 @@ class APIServerAdapter(BasePlatformAdapter):
             "/api/research/runs/{run_id}/iterations/{iteration}/mutation-audit",
             self._handle_research_iteration_mutation_audit,
         )
+
+        # Serve frontend static files (Next.js static export) if available
+        frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend" / "out"
+        if frontend_dir.is_dir():
+            async def _handle_frontend(request: web.Request) -> web.StreamResponse:
+                # Try to serve the exact file
+                rel_path = request.match_info.get("path", "")
+                file_path = frontend_dir / rel_path
+                if file_path.is_file():
+                    return web.FileResponse(file_path)
+                # Try with index.html for directory paths
+                index = file_path / "index.html"
+                if index.is_file():
+                    return web.FileResponse(index)
+                # SPA fallback to root index.html
+                root_index = frontend_dir / "index.html"
+                if root_index.is_file():
+                    return web.FileResponse(root_index)
+                return web.Response(status=404, text="Not found")
+
+            app.router.add_get("/{path:.*}", _handle_frontend)
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -863,6 +886,34 @@ class APIServerAdapter(BasePlatformAdapter):
             return self._json_error(str(exc))
 
         return web.json_response({"object": "research.event", "data": event, "run": run})
+
+    async def _handle_research_global_chat_post(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await self._parse_json_body(request)
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        try:
+            message = self._research_manager.add_global_message(
+                content=str(body.get("message") or ""),
+                author=str(body.get("author") or "operator"),
+            )
+        except ValueError as exc:
+            return self._json_error(str(exc))
+
+        return web.json_response({"object": "research.message", "data": message})
+
+    async def _handle_research_global_chat_list(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        messages = self._research_manager.list_global_messages()
+        return web.json_response({"messages": messages})
 
     async def _handle_research_run_request_mutation(self, request: "web.Request") -> "web.Response":
         auth_err = self._check_auth(request)
