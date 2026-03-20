@@ -138,11 +138,11 @@ export default function HomePage() {
             Active Synthesis
           </h1>
           <Link
-            href="#"
-            className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-on-primary rounded-lg text-sm font-label hover:bg-primary/90 transition-colors"
+            href="/runs"
+            className="inline-flex items-center gap-2 px-4 py-2 text-outline hover:text-primary text-sm font-label transition-colors"
           >
-            <Icon name="add" className="text-lg" />
-            New Run
+            <Icon name="history" className="text-lg" />
+            All Runs
           </Link>
         </div>
 

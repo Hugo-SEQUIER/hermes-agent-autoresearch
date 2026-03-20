@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Icon } from "./Icon";
 
 const NAV_ITEMS = [
   { label: "Dashboard", href: "/" },
@@ -43,14 +42,7 @@ export function Header() {
           })}
         </nav>
       </div>
-      <div className="flex items-center gap-4">
-        <button className="text-on-surface-variant hover:text-primary transition-colors">
-          <Icon name="notifications" />
-        </button>
-        <button className="text-on-surface-variant hover:text-primary transition-colors">
-          <Icon name="settings" />
-        </button>
-      </div>
+      <div className="flex items-center gap-4" />
     </header>
   );
 }
